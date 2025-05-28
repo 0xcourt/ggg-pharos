@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Swap Token PHRS <-> USDC</title>
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background-color: #f0f2f5;
+            margin: 0;
+        }
+        .swap-container {
+            background-color: #ffffff;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            width: 400px;
+            text-align: center;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .input-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #555;
+        }
+        .input-group input, .input-group select {
+            width: calc(100% - 20px);
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        .input-group select {
+            width: 100%; /* Adjust for select element */
+        }
+        .swap-button {
+            background-color: #007bff;
+            color: white;
+            padding: 12px 25px;
+            border: none;
+            border-radius: 5px;
+            font-size: 18px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+            width: 100%;
+        }
+        .swap-button:hover {
+            background-color: #0056b3;
+        }
+        .message {
+            margin-top: 20px;
+            color: green;
+            font-weight: bold;
+        }
+        .error {
+            color: red;
+        }
+        .swap-icon {
+            cursor: pointer;
+            font-size: 24px;
+            margin: 10px 0;
+            color: #777;
+            transition: transform 0.2s ease;
+        }
+        .swap-icon:hover {
+            transform: rotate(180deg);
+        }
+    </style>
+</head>
+<body>
+    <div class="swap-container">
+        <h1>Swap Token</h1>
+        <div class="input-group">
+            <label for="fromAmount">Jumlah:</label>
+            <input type="number" id="fromAmount" placeholder="0.0" min="0">
+        </div>
+        <div class="input-group">
+            <label for="fromToken">Dari Token:</label>
+            <select id="fromToken">
+                <option value="PHRS">PHRS</option>
+                <option value="USDC">USDC</option>
+            </select>
+        </div>
+        <div class="swap-icon" id="swapDirection">&#x21C5;</div> <div class="input-group">
+            <label for="toToken">Ke Token:</label>
+            <select id="toToken">
+                <option value="USDC">USDC</option>
+                <option value="PHRS">PHRS</option>
+            </select>
+        </div>
+        <div class="input-group">
+            <label for="toAmount">Anda Akan Mendapatkan:</label>
+            <input type="text" id="toAmount" placeholder="0.0" readonly>
+        </div>
+        <button class="swap-button" id="initiateSwap">Swap</button>
+        <p class="message" id="swapMessage"></p>
+    </div>
+
+    <script>
+        // --- KONSTANTA YANG PERLU ANDA GANTI ---
+        // Ganti dengan alamat kontrak yang benar untuk jaringan Anda
+        // Jika PHRS adalah native token, gunakan WPHRS (Wrapped PHRS) untuk swap di DEX.
+        // Jika PHRS sudah ERC-20, gunakan alamat kontrak PHRS.
+        const PHRS_ADDRESS = "0x76aaada469d23216be5f7c596fa25f282ff9b364";  // Alamat kontrak PHRS (jika ERC-20) atau WPHRS (jika PHRS adalah native token)
+        const USDC_ADDRESS = "0xad902cf99c2de2f1ba5ec4d642fd7e49cae9ee37";  // Alamat kontrak USDC
+        const SWAP_ROUTER_ADDRESS = "0x1a4de519154ae51200b0ad7c90f7fac75547888a"; // Alamat kontrak Uniswap V3 SwapRouter atau yang setara
+
+        // ABI minimal yang diperlukan untuk interaksi kontrak
+        const ERC20_ABI = [
+            "function approve(address spender, uint256 amount) returns (bool)",
+            "function balanceOf(address account) view returns (uint256)",
+            "function decimals() view returns (uint8)",
+            "function symbol() view returns (string)" // Untuk logging yang lebih baik
+        ];
+
+        const SWAP_ROUTER_ABI = [
+            // ABI untuk fungsi `multicall` dan `exactInputSingle`
+            // Ini adalah representasi sederhana dari ABI yang lebih besar
+            "function multicall(uint256 deadline, bytes[] calldata data) payable returns (bytes[] memory results)",
+            "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)"
+        ];
+
+        // --- Helper Functions ---
+
+        /**
+         * Membangun data transaksi untuk fungsi exactInputSingle dari Uniswap V3 SwapRouter.
+         * @param {object} params - Objek berisi parameter swap.
+         * @returns {string} - Data heksadesimal dari encoded function call.
+         */
+        function getExactInputSingleData(params) {
+            const abiCoder = new ethers.utils.Interface(SWAP_ROUTER_ABI);
+            return abiCoder.encodeFunctionData(
+                "exactInputSingle",
+                [{
+                    tokenIn: params.tokenIn,
+                    tokenOut: params.tokenOut,
+                    fee: params.fee,
+                    recipient: params.recipient,
+                    amountIn: params.amountIn,
+                    amountOutMinimum: params.amountOutMinimum,
+                    sqrtPriceLimitX96: params.sqrtPriceLimitX96
+                }]
+            );
+        }
+
+        /**
+         * Melakukan persetujuan (approve) token jika diperlukan.
+         * @param {ethers.Contract} tokenContract - Instance kontrak token (misal PHRS atau USDC).
+         * @param {string} ownerAddress - Alamat pemilik token (alamat dompet pengguna).
+         * @param {string} spenderAddress - Alamat kontrak yang diizinkan untuk menghabiskan token (router DEX).
+         * @param {ethers.BigNumber} amount - Jumlah token yang ingin di-approve (dalam BigNumber).
+         * @returns {Promise<void>}
+         */
+        async function approveTokenIfNeeded(tokenContract, ownerAddress, spenderAddress, amount) {
+            const allowance = await tokenContract.allowance(ownerAddress, spenderAddress);
+            const tokenSymbol = await tokenContract.symbol();
+            const tokenDecimals = await tokenContract.decimals();
+
+            if (allowance.lt(amount)) { // Jika allowance kurang dari jumlah yang dibutuhkan
+                console.log(`Meminta persetujuan untuk ${ethers.utils.formatUnits(amount, tokenDecimals)} ${tokenSymbol}...`);
+                const approveTx = await tokenContract.approve(spenderAddress, amount);
+                await approveTx.wait();
+                console.log(`Persetujuan ${tokenSymbol} berhasil!`);
+            } else {
+                console.log(`${tokenSymbol} sudah diizinkan untuk router.`);
+            }
+        }
+
+        /**
+         * Fungsi utama untuk melakukan swap antara PHRS dan USDC.
+         * @param {string} tokenInAddress - Alamat token yang akan diberikan (PHRS_ADDRESS atau USDC_ADDRESS).
+         * @param {string} tokenOutAddress - Alamat token yang akan diterima (USDC_ADDRESS atau PHRS_ADDRESS).
+         * @param {string} amountInHuman - Jumlah tokenIn yang ingin di-swap (dalam format desimal, cth. "1.5").
+         * @param {number} poolFee - Fee pool Uniswap V3 (misal: 500 untuk 0.05%, 3000 untuk 0.3%, 10000 untuk 1%).
+         * @returns {Promise<object>} Objek hasil swap (berhasil/gagal dan hash transaksi).
+         */
+        async function initiateSwapProcess(tokenInAddress, tokenOutAddress, amountInHuman, poolFee = 500) {
+            if (!window.ethereum) {
+                throw new Error("MetaMask atau dompet Web3 tidak terdeteksi! Silakan instal atau aktifkan.");
+            }
+
+            const provider = new ethers.providers.Web3Provider(window.ethereum);
+            const signer = provider.getSigner();
+            const userAddress = await signer.getAddress();
+
+            console.log(`Memulai swap: ${tokenInAddress} -> ${tokenOutAddress} dengan jumlah ${amountInHuman}`);
+
+            try {
+                const tokenInContract = new ethers.Contract(tokenInAddress, ERC20_ABI, signer);
+                const routerContract = new ethers.Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, signer);
+
+                const tokenInDecimals = await tokenInContract.decimals();
+                const amountInWei = ethers.utils.parseUnits(amountInHuman, tokenInDecimals);
+
+                // 1. Lakukan Approve jika diperlukan
+                await approveTokenIfNeeded(tokenInContract, userAddress, SWAP_ROUTER_ADDRESS, amountInWei);
+
+                // 2. Siapkan data swap menggunakan exactInputSingle
+                // NOTE: amountOutMinimum = 0 sangat berisiko! Anda harus menghitung ini
+                //       berdasarkan estimasi harga dan slippage tolerance.
+                const exactInputData = getExactInputSingleData({
+                    tokenIn: tokenInAddress,
+                    tokenOut: tokenOutAddress,
+                    fee: poolFee,
+                    recipient: userAddress,
+                    amountIn: amountInWei,
+                    amountOutMinimum: 0, // GANTI INI!
+                    sqrtPriceLimitX96: 0 // Biarkan 0 untuk tidak menetapkan batas harga spesifik
+                });
+
+                // 3. Estimasi gas (opsional tapi disarankan)
+                let gasLimit = 250000; // Default gas limit yang aman
+                const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 menit dari sekarang
+
+                try {
+                    // Karena menggunakan multicall, kita estimasi gas untuk multicall dengan data exactInputSingle
+                    gasLimit = await routerContract.estimateGas.multicall(
+                        deadline, // Parameter deadline juga perlu dimasukkan saat estimasi
+                        [exactInputData]
+                    );
+                    gasLimit = ethers.BigNumber.from(gasLimit).mul(120).div(100); // Tambahkan buffer 20%
+                    console.log(`Estimasi Gas: ${gasLimit.toString()}`);
+                } catch (e) {
+                    console.warn("Gagal mengestimasi gas, menggunakan gas limit default. Error:", e.message);
+                }
+
+
+                // 4. Kirim transaksi swap menggunakan multicall
+                console.log("Mengirim transaksi swap...");
+                const tx = await routerContract.multicall(
+                    deadline,
+                    [exactInputData],
+                    { gasLimit: gasLimit }
+                );
+
+                console.log(`Transaksi Swap Dikirim: ${tx.hash}`);
+                document.getElementById('swapMessage').textContent = `Transaksi dikirim: ${tx.hash}. Menunggu konfirmasi...`;
+                document.getElementById('swapMessage').className = 'message';
+
+                await tx.wait(); // Tunggu konfirmasi transaksi
+
+                console.log("Swap berhasil dikonfirmasi!");
+                return { success: true, transactionHash: tx.hash };
+
+            } catch (error) {
+                console.error("Kesalahan saat melakukan swap:", error);
+                // Cek jika error adalah penolakan oleh user
+                if (error.code === 4001) {
+                    throw new Error("Transaksi ditolak oleh pengguna.");
+                } else if (error.message.includes("user rejected transaction")) {
+                    throw new Error("Transaksi ditolak oleh pengguna.");
+                }
+                throw new Error(`Swap gagal: ${error.message || "Terjadi kesalahan yang tidak diketahui."}`);
+            }
+        }
+
+        // --- Logika UI yang ada sebelumnya ---
+        const fromAmountInput = document.getElementById('fromAmount');
+        const fromTokenSelect = document.getElementById('fromToken');
+        const toTokenSelect = document.getElementById('toToken');
+        const toAmountInput = document.getElementById('toAmount');
+        const initiateSwapButton = document.getElementById('initiateSwap');
+        const swapMessage = document.getElementById('swapMessage');
+        const swapDirectionIcon = document.getElementById('swapDirection');
+
+        // Fungsi untuk mengestimasi jumlah token yang akan diterima
+        // Ini HANYA simulasi, dalam produksi Anda akan menggunakan API DEX
+        async function estimateSwapAmount() {
+            const fromTokenSymbol = fromTokenSelect.value;
+            const toTokenSymbol = toTokenSelect.value;
+            const amount = parseFloat(fromAmountInput.value);
+
+            if (isNaN(amount) || amount <= 0) {
+                toAmountInput.value = '0.0';
+                return;
+            }
+
+            // Ini adalah contoh estimasi sangat sederhana.
+            // Untuk estimasi yang akurat, Anda perlu memanggil Uniswap SDK atau API harga
+            // Misalnya: uniswap/v3-sdk, atau menggunakan ethers.js untuk read-only calls ke pool/router
+            let estimatedAmount;
+            if (fromTokenSymbol === 'PHRS' && toTokenSymbol === 'USDC') {
+                // Contoh: 1 PHRS = 0.5 USDC
+                estimatedAmount = amount * 0.5;
+            } else if (fromTokenSymbol === 'USDC' && toTokenSymbol === 'PHRS') {
+                // Contoh: 1 USDC = 2 PHRS
+                estimatedAmount = amount * 2;
+            } else {
+                estimatedAmount = amount; // Jika token sama
+            }
+            toAmountInput.value = estimatedAmount.toFixed(4); // Tampilkan 4 angka di belakang koma
+        }
+
+        // Fungsi untuk menukar arah swap
+        function toggleSwapDirection() {
+            const currentFrom = fromTokenSelect.value;
+            const currentTo = toTokenSelect.value;
+
+            fromTokenSelect.value = currentTo;
+            toTokenSelect.value = currentFrom;
+            estimateSwapAmount(); // Recalculate after changing direction
+        }
+
+        // Event Listeners
+        fromAmountInput.addEventListener('input', estimateSwapAmount);
+        fromTokenSelect.addEventListener('change', estimateSwapAmount);
+        toTokenSelect.addEventListener('change', estimateSwapAmount);
+        swapDirectionIcon.addEventListener('click', toggleSwapDirection);
+
+        initiateSwapButton.addEventListener('click', async () => {
+            const fromTokenSymbol = fromTokenSelect.value;
+            const toTokenSymbol = toTokenSelect.value;
+            const amount = fromAmountInput.value; // Ambil nilai mentah dari input
+
+            if (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+                swapMessage.textContent = 'Masukkan jumlah yang valid.';
+                swapMessage.className = 'message error';
+                return;
+            }
+
+            let tokenInAddress, tokenOutAddress;
+            if (fromTokenSymbol === "PHRS") {
+                tokenInAddress = PHRS_ADDRESS; // Ini bisa WPHRS jika PHRS adalah native token
+                tokenOutAddress = USDC_ADDRESS;
+            } else { // USDC
+                tokenInAddress = USDC_ADDRESS;
+                tokenOutAddress = PHRS_ADDRESS; // Ini bisa WPHRS jika PHRS adalah native token
+            }
+
+            swapMessage.textContent = 'Menghubungkan ke dompet dan memulai proses swap...';
+            swapMessage.className = 'message';
+
+            try {
+                // Panggil fungsi swap utama
+                const result = await initiateSwapProcess(tokenInAddress, tokenOutAddress, amount, 500); // 500 = 0.05% fee pool Uniswap V3
+                swapMessage.textContent = `Swap berhasil! Transaction Hash: ${result.transactionHash}`;
+                swapMessage.className = 'message';
+                fromAmountInput.value = ''; // Kosongkan input setelah sukses
+                toAmountInput.value = '';
+            } catch (e) {
+                swapMessage.textContent = `Swap gagal: ${e.message}`;
+                swapMessage.className = 'message error';
+                console.error(e);
+            }
+        });
+
+        // Inisialisasi estimasi saat halaman dimuat
+        estimateSwapAmount();
+    </script>
+</body>
+</html>
